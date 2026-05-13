@@ -1,0 +1,37 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: only light;
+}
+
+body {
+  margin: 0;
+  min-height: 100dvh;
+  min-height: 100svh;
+  overflow-x: hidden;
+  font-family:
+    'Segoe UI',
+    system-ui,
+    -apple-system,
+    Roboto,
+    'Helvetica Neue',
+    Arial,
+    sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  background: #d4cfe0;
+  color: #1e1b2e;
+}
+
+#app {
+  min-height: 100dvh;
+  min-height: 100svh;
+}
+
+code {
+  font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, monospace;
+}
