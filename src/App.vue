@@ -7,6 +7,8 @@ import {
   manusStepsMainEntries,
 } from './utils/manusStepDisplay'
 import { buildChatUrl, consumeSseResponse, type SseMessage } from './utils/sse'
+import brandIconUrl from './assets/wiselink-robot-head.png'
+import assistantAvatarUrl from './assets/wiselink-logo-circle.png'
 
 export interface ManusStep {
   phase?: string
@@ -99,6 +101,208 @@ const assistantReplyInFlight = computed(() => {
   const m = list[list.length - 1]
   return !!(m?.role === 'assistant' && !m.streamComplete)
 })
+
+/** 点击助手头像时展示的 Agent 介绍 Popover（Teleport 到 body，避免被 feed 裁剪） */
+const agentPopoverMessageId = ref<string | null>(null)
+const agentPopoverAnchorRef = ref<HTMLElement | null>(null)
+const agentPopoverPos = ref({ top: 0, left: 0 })
+
+const agentPopoverMessage = computed(() => {
+  const id = agentPopoverMessageId.value
+  if (!id) return null
+  return messages.value.find((x) => x.id === id) ?? null
+})
+
+const POPOVER_CARD_W = 268
+const POPOVER_GAP = 10
+
+function updateAgentPopoverPosition(anchor: HTMLElement) {
+  const r = anchor.getBoundingClientRect()
+  const vw = window.innerWidth
+  const vh = window.innerHeight
+  const gap = POPOVER_GAP
+  const estH = 300
+  let left: number
+  let top: number
+
+  const placeBelow = r.bottom + gap + estH <= vh - 12 && r.top < vh * 0.55
+  if (placeBelow) {
+    top = r.bottom + gap
+    left = Math.min(Math.max(10, r.left), vw - POPOVER_CARD_W - 10)
+  } else {
+    left = r.right + gap
+    if (left + POPOVER_CARD_W > vw - 10) {
+      left = Math.max(10, r.left - POPOVER_CARD_W - gap)
+    }
+    top = r.top
+    if (top + estH > vh - 10) {
+      top = Math.max(10, vh - estH - 10)
+    }
+  }
+
+  agentPopoverPos.value = { top, left }
+}
+
+function toggleAgentPopover(m: ChatMessage, ev: MouseEvent) {
+  if (m.role !== 'assistant') return
+  ev.stopPropagation()
+  const el = ev.currentTarget as HTMLElement
+  if (agentPopoverMessageId.value === m.id) {
+    closeAgentPopover()
+    return
+  }
+  agentPopoverMessageId.value = m.id
+  agentPopoverAnchorRef.value = el
+  nextTick(() => updateAgentPopoverPosition(el))
+}
+
+/** Popover 关闭：仅清空状态，绝不 blur，避免抢输入框焦点。 */
+function closeAgentPopover() {
+  agentPopoverMessageId.value = null
+  agentPopoverAnchorRef.value = null
+}
+
+function repositionOpenAgentPopover() {
+  const anchor = agentPopoverAnchorRef.value
+  if (agentPopoverMessageId.value && anchor) {
+    updateAgentPopoverPosition(anchor)
+  }
+}
+
+function onAgentPopoverEscape(ev: KeyboardEvent) {
+  if (ev.key !== 'Escape' || !agentPopoverMessageId.value) return
+  ev.preventDefault()
+  closeAgentPopover()
+}
+
+const AGENT_POPOVER_TAGS_NORMAL = [
+  '商品选购',
+  '多维对比',
+  '理性算账',
+  '生活服务',
+] as const
+const AGENT_POPOVER_TAGS_MANUS = [
+  '自主任务拆解',
+  '深度数据抓取',
+  '跨平台调度',
+  '报告导出',
+] as const
+
+const agentPopoverTitle = computed(() => {
+  const m = agentPopoverMessage.value
+  if (!m) return ''
+  return m.mode === 'manus' ? 'Manus (全能执行助理)' : '智选灵犀 (专属导购朋友)'
+})
+
+const agentPopoverTags = computed(() => {
+  const m = agentPopoverMessage.value
+  if (!m) return [] as string[]
+  return m.mode === 'manus'
+    ? [...AGENT_POPOVER_TAGS_MANUS]
+    : [...AGENT_POPOVER_TAGS_NORMAL]
+})
+
+const agentPopoverFooter = computed(() => {
+  const m = agentPopoverMessage.value
+  if (!m) return ''
+  return m.mode === 'manus'
+    ? '⚡ 高能待命中 | 期待复杂指令挑战'
+    : '🟢 实时在线 | 随时准备为你货比三家'
+})
+
+const AGENT_QUICK_PROMPT_COMPARE =
+  '帮我对比一下最近热门的两款手机，看看哪款性价比更高。'
+const AGENT_QUICK_PROMPT_MANUS_DEEP =
+  '帮我全网搜索关于 [待填入主题] 的深度信息并生成一份分析报告。'
+
+/**
+ * 一键直达：在 Popover 已关、键盘与布局稳定后滚动（须晚于 close，避免布局塌陷冲掉 scrollIntoView）。
+ */
+function scrollAgentPromptAfterPopoverClosed() {
+  const el = document.getElementById('user-prompt') as HTMLTextAreaElement | null
+  if (!el) return
+  try {
+    el.scrollIntoView({ behavior: 'smooth', block: 'end', inline: 'nearest' })
+  } catch {
+    el.scrollIntoView(false)
+  }
+  const dock = el.closest('.composer-dock')
+  if (dock) {
+    try {
+      ;(dock as HTMLElement).scrollIntoView({
+        behavior: 'smooth',
+        block: 'end',
+        inline: 'nearest',
+      })
+    } catch {
+      ;(dock as HTMLElement).scrollIntoView(false)
+    }
+  }
+  const card = el.closest('.chat-window')
+  if (card) {
+    try {
+      ;(card as HTMLElement).scrollIntoView({
+        behavior: 'smooth',
+        block: 'end',
+        inline: 'nearest',
+      })
+    } catch {
+      ;(card as HTMLElement).scrollIntoView(false)
+    }
+  }
+}
+
+/**
+ * 一键直达：必须在 click 同步栈内先 focus 再改值与选区，否则 iOS / Android 不会弹出软键盘。
+ * 滚动与关卡片解耦：先关 Popover，再宏任务延迟滚动，避免塌陷冲掉 scrollIntoView。
+ */
+function applyAgentQuickPromptFromUserGesture(
+  mode: 'normal' | 'manus',
+  text: string,
+  selectBracket: boolean,
+) {
+  const el = document.getElementById('user-prompt') as HTMLTextAreaElement | null
+  if (!el || el.disabled) return
+
+  el.focus({ preventScroll: true })
+
+  activeTab.value = mode
+  userPrompt.value = text
+  el.value = text
+  el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true }))
+
+  if (selectBracket) {
+    const open = text.indexOf('[')
+    const close = text.indexOf(']', open + 1)
+    if (open !== -1 && close > open) {
+      el.setSelectionRange(open + 1, close)
+    } else {
+      el.setSelectionRange(text.length, text.length)
+    }
+  } else {
+    el.setSelectionRange(text.length, text.length)
+  }
+
+  closeAgentPopover()
+
+  if (typeof window !== 'undefined') {
+    window.setTimeout(() => {
+      scrollAgentPromptAfterPopoverClosed()
+    }, 150)
+  }
+}
+
+function onAgentQuickCompare(ev: MouseEvent) {
+  ev.stopPropagation()
+  ev.preventDefault()
+  applyAgentQuickPromptFromUserGesture('normal', AGENT_QUICK_PROMPT_COMPARE, false)
+}
+
+function onAgentQuickManusDeep(ev: MouseEvent) {
+  ev.stopPropagation()
+  ev.preventDefault()
+  applyAgentQuickPromptFromUserGesture('manus', AGENT_QUICK_PROMPT_MANUS_DEEP, true)
+}
 
 const canSend = computed(
   () =>
@@ -640,6 +844,8 @@ onMounted(() => {
     syncMq()
     mq.addEventListener('change', syncMq)
   }
+  window.addEventListener('resize', repositionOpenAgentPopover)
+  window.addEventListener('keydown', onAgentPopoverEscape)
 })
 onBeforeUnmount(() => {
   abort?.abort()
@@ -647,6 +853,8 @@ onBeforeUnmount(() => {
   stopManusStepRaf()
   cancelFollowScroll()
   mq?.removeEventListener('change', syncMq)
+  window.removeEventListener('resize', repositionOpenAgentPopover)
+  window.removeEventListener('keydown', onAgentPopoverEscape)
 })
 
 const tabLabel = computed(() =>
@@ -675,13 +883,24 @@ function streamPlainPreview(m: ChatMessage): string {
         <header class="window-head">
           <div class="topbar-inner">
             <div class="topbar-brand">
-              <span class="logo-dot" aria-hidden="true" />
+              <img
+                class="topbar-brand-mark"
+                :src="brandIconUrl"
+                width="28"
+                height="28"
+                alt=""
+                decoding="async"
+              />
               <h1 class="topbar-title">WiseLink AI</h1>
             </div>
           </div>
         </header>
 
-        <div ref="feedWrap" class="feed-wrap">
+        <div
+          ref="feedWrap"
+          class="feed-wrap"
+          @scroll.passive="repositionOpenAgentPopover"
+        >
           <div class="feed">
             <template v-if="messages.length === 0">
               <div class="onboarding-spacer" aria-hidden="true" />
@@ -709,6 +928,26 @@ function streamPlainPreview(m: ChatMessage): string {
               class="msg-row"
               :class="m.role"
             >
+              <button
+                v-if="m.role === 'assistant'"
+                type="button"
+                class="msg-avatar msg-avatar-assistant"
+                :class="{ 'is-agent-popover-open': agentPopoverMessageId === m.id }"
+                aria-label="查看助手介绍"
+                :aria-expanded="agentPopoverMessageId === m.id"
+                aria-haspopup="dialog"
+                @click="toggleAgentPopover(m, $event)"
+              >
+                <img
+                  class="msg-avatar-img"
+                  :src="assistantAvatarUrl"
+                  width="40"
+                  height="40"
+                  alt=""
+                  decoding="async"
+                />
+              </button>
+              <div class="msg-stack">
           <div class="msg-meta">
             {{ m.role === 'user' ? '你' : '助手' }}
             <span v-if="m.role === 'assistant'" class="mode-tag">{{ m.mode === 'normal' ? '智选灵犀' : 'Manus' }}</span>
@@ -841,7 +1080,7 @@ function streamPlainPreview(m: ChatMessage): string {
               {{ m.content }}
             </template>
           </div>
-
+              </div>
             </div>
 
             <div v-if="error" class="alert" role="alert">
@@ -905,6 +1144,88 @@ function streamPlainPreview(m: ChatMessage): string {
     </div>
 
     <footer class="page-foot">© 2026 WiseLink. 保留所有权利。</footer>
+
+    <Teleport to="body">
+      <Transition name="agent-popover">
+        <div
+          v-if="agentPopoverMessage"
+          class="agent-popover-layer"
+          :key="agentPopoverMessage.id"
+        >
+          <div
+            class="agent-popover-backdrop"
+            aria-hidden="true"
+            @click="closeAgentPopover"
+          />
+          <div
+            class="agent-popover-card"
+            :class="
+              agentPopoverMessage.mode === 'manus'
+                ? 'agent-popover-card--manus'
+                : 'agent-popover-card--normal'
+            "
+            role="dialog"
+            aria-modal="true"
+            :aria-labelledby="'agent-popover-title-' + agentPopoverMessage.id"
+            :style="{
+              top: agentPopoverPos.top + 'px',
+              left: agentPopoverPos.left + 'px',
+              width: POPOVER_CARD_W + 'px',
+            }"
+            @click.stop
+          >
+            <div class="agent-popover-shine" aria-hidden="true" />
+            <div class="agent-popover-head">
+              <img
+                class="agent-popover-avatar"
+                :src="assistantAvatarUrl"
+                width="44"
+                height="44"
+                alt=""
+                decoding="async"
+              />
+              <div class="agent-popover-head-text">
+                <h2
+                  :id="'agent-popover-title-' + agentPopoverMessage.id"
+                  class="agent-popover-title"
+                >
+                  {{ agentPopoverTitle }}
+                </h2>
+              </div>
+            </div>
+            <div class="agent-popover-tags" aria-label="技能标签">
+              <span
+                v-for="(tag, i) in agentPopoverTags"
+                :key="i"
+                class="agent-popover-tag"
+              >
+                {{ tag }}
+              </span>
+            </div>
+            <p class="agent-popover-footer">
+              {{ agentPopoverFooter }}
+            </p>
+            <button
+              v-if="agentPopoverMessage.mode === 'normal'"
+              type="button"
+              class="agent-popover-action agent-popover-action--purple"
+              @click.stop="onAgentQuickCompare"
+            >
+              ⚡ 帮我货比三家
+            </button>
+            <button
+              v-else
+              type="button"
+              class="agent-popover-action agent-popover-action--blue"
+              @click.stop="onAgentQuickManusDeep"
+            >
+              🛠️ 开启深度任务
+            </button>
+            <p class="agent-popover-hint">点击空白处关闭 · Esc</p>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
 
@@ -946,17 +1267,17 @@ function streamPlainPreview(m: ChatMessage): string {
 .topbar-brand {
   display: flex;
   align-items: center;
-  gap: 0.6rem;
+  gap: 0.5rem;
   min-width: 0;
 }
 
-.logo-dot {
-  width: 2.25rem;
-  height: 2.25rem;
-  border-radius: 0.75rem;
-  background: linear-gradient(145deg, #4c1d95, #7c3aed);
+.topbar-brand-mark {
+  width: 1.75rem;
+  height: 1.75rem;
+  border-radius: 0.55rem;
+  object-fit: cover;
   flex-shrink: 0;
-  box-shadow: 0 4px 14px rgba(59, 7, 100, 0.45);
+  box-shadow: 0 2px 10px rgba(59, 7, 100, 0.22);
 }
 
 .topbar-title {
@@ -1076,14 +1397,121 @@ function streamPlainPreview(m: ChatMessage): string {
 
 .msg-row {
   display: flex;
-  flex-direction: column;
   gap: 0.35rem;
   max-width: 100%;
   overflow-anchor: none;
 }
 
 .msg-row.user {
+  flex-direction: column;
   align-items: flex-end;
+}
+
+.msg-row.user .msg-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.35rem;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.msg-row.assistant {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 0.55rem;
+}
+
+.msg-row.assistant .msg-stack {
+  flex: 1;
+  min-width: 0;
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.35rem;
+}
+
+.msg-avatar {
+  flex-shrink: 0;
+  border-radius: 999px;
+  background: linear-gradient(145deg, #ede9fe, #faf5ff);
+}
+
+button.msg-avatar.msg-avatar-assistant {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  font: inherit;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+button.msg-avatar.msg-avatar-assistant:focus-visible {
+  outline: 2px solid rgba(124, 58, 237, 0.55);
+  outline-offset: 2px;
+}
+
+button.msg-avatar.msg-avatar-assistant.is-agent-popover-open {
+  outline: 2px solid rgba(124, 58, 237, 0.45);
+  outline-offset: 2px;
+}
+
+.msg-avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  pointer-events: none;
+  border-radius: inherit;
+}
+
+.msg-avatar-assistant {
+  width: 2.5rem;
+  height: 2.5rem;
+  margin-top: 0.05rem;
+  box-shadow:
+    0 2px 12px rgba(76, 29, 149, 0.28),
+    0 0 0 1px rgba(255, 255, 255, 0.65) inset;
+  animation: assistant-avatar-breathe 3.2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .msg-avatar-assistant {
+    animation: none;
+  }
+}
+
+@media (max-width: 420px) {
+  .msg-avatar-assistant {
+    width: 2.25rem;
+    height: 2.25rem;
+  }
+
+  .topbar-brand-mark {
+    width: 1.5rem;
+    height: 1.5rem;
+  }
+}
+
+@keyframes assistant-avatar-breathe {
+  0%,
+  100% {
+    box-shadow:
+      0 2px 12px rgba(76, 29, 149, 0.22),
+      0 0 0 1px rgba(255, 255, 255, 0.65) inset,
+      0 0 10px rgba(0, 210, 255, 0.12);
+    transform: scale(1);
+  }
+  50% {
+    box-shadow:
+      0 4px 18px rgba(124, 58, 237, 0.38),
+      0 0 0 1px rgba(255, 255, 255, 0.75) inset,
+      0 0 18px rgba(0, 210, 255, 0.22);
+    transform: scale(1.02);
+  }
 }
 
 .msg-row.user .msg-bubble {
@@ -1091,10 +1519,6 @@ function streamPlainPreview(m: ChatMessage): string {
   border: 1px solid rgba(42, 8, 72, 0.16);
   border-radius: 1.25rem;
   box-shadow: 0 3px 14px rgba(42, 8, 72, 0.08);
-}
-
-.msg-row.assistant {
-  align-items: flex-start;
 }
 
 .msg-row.assistant .msg-bubble {
@@ -1619,6 +2043,325 @@ function streamPlainPreview(m: ChatMessage): string {
   color: #9ca3af;
   padding: 0.4rem 1rem calc(0.55rem + env(safe-area-inset-bottom, 0px));
   letter-spacing: 0.03em;
+}
+
+.agent-popover-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 9998;
+  pointer-events: none;
+}
+
+/* 关闭时淡出（等价 Tailwind transition-opacity） */
+.agent-popover-enter-active,
+.agent-popover-leave-active {
+  transition: opacity 0.22s ease;
+}
+
+.agent-popover-enter-from,
+.agent-popover-leave-to {
+  opacity: 0;
+}
+
+.agent-popover-backdrop {
+  position: absolute;
+  inset: 0;
+  pointer-events: auto;
+  background: rgba(15, 23, 42, 0.12);
+  /* backdrop-blur-md */
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+/* rounded-xl + shadow-lg + bg-white/80 + backdrop-blur-md（项目未装 Tailwind，用 CSS 对齐常用 token） */
+.agent-popover-card {
+  position: fixed;
+  z-index: 9999;
+  pointer-events: auto;
+  max-width: calc(100vw - 20px);
+  box-sizing: border-box;
+  padding: 1rem 1rem 0.7rem;
+  border-radius: 0.75rem;
+  background: rgba(255, 255, 255, 0.82);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(124, 58, 237, 0.28);
+  box-shadow:
+    0 10px 15px -3px rgba(15, 23, 42, 0.08),
+    0 4px 6px -4px rgba(15, 23, 42, 0.06),
+    0 20px 38px -14px rgba(76, 29, 149, 0.22);
+  overflow-x: hidden;
+  overflow-y: auto;
+  max-height: min(72vh, 22rem);
+  isolation: isolate;
+}
+
+.agent-popover-card--normal {
+  border-color: rgba(109, 40, 217, 0.38);
+  box-shadow:
+    0 10px 15px -3px rgba(15, 23, 42, 0.08),
+    0 4px 6px -4px rgba(15, 23, 42, 0.06),
+    0 22px 44px -12px rgba(91, 33, 182, 0.28);
+}
+
+.agent-popover-card--manus {
+  border-color: rgba(37, 99, 235, 0.42);
+  box-shadow:
+    0 10px 15px -3px rgba(15, 23, 42, 0.08),
+    0 4px 6px -4px rgba(15, 23, 42, 0.06),
+    0 22px 44px -12px rgba(29, 78, 216, 0.26);
+}
+
+.agent-popover-shine {
+  position: absolute;
+  top: -40%;
+  right: -30%;
+  width: 72%;
+  height: 75%;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.agent-popover-card--normal .agent-popover-shine {
+  background: radial-gradient(
+    circle at 35% 42%,
+    rgba(167, 139, 250, 0.35) 0%,
+    rgba(124, 58, 237, 0.1) 42%,
+    transparent 70%
+  );
+}
+
+.agent-popover-card--manus .agent-popover-shine {
+  background: radial-gradient(
+    circle at 35% 42%,
+    rgba(96, 165, 250, 0.45) 0%,
+    rgba(59, 130, 246, 0.12) 45%,
+    transparent 70%
+  );
+}
+
+.agent-popover-head {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  margin-bottom: 0.75rem;
+}
+
+.agent-popover-avatar {
+  width: 2.75rem;
+  height: 2.75rem;
+  border-radius: 999px;
+  object-fit: cover;
+  flex-shrink: 0;
+  box-shadow:
+    0 2px 12px rgba(76, 29, 149, 0.28),
+    0 0 0 2px rgba(255, 255, 255, 0.9);
+}
+
+.agent-popover-card--manus .agent-popover-avatar {
+  box-shadow:
+    0 2px 12px rgba(29, 78, 216, 0.3),
+    0 0 0 2px rgba(255, 255, 255, 0.9);
+}
+
+.agent-popover-head-text {
+  min-width: 0;
+}
+
+.agent-popover-title {
+  margin: 0;
+  font-size: 0.98rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  line-height: 1.3;
+  color: #2d1b4e;
+}
+
+.agent-popover-card--manus .agent-popover-title {
+  color: #172554;
+}
+
+.agent-popover-tags {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.85rem;
+}
+
+.agent-popover-tag {
+  display: inline-block;
+  font-size: 0.68rem;
+  font-weight: 650;
+  line-height: 1.2;
+  padding: 0.28rem 0.5rem;
+  border-radius: 999px;
+  letter-spacing: 0.02em;
+}
+
+.agent-popover-card--normal .agent-popover-tag {
+  color: #4c1d95;
+  background: rgba(237, 233, 254, 0.95);
+  border: 1px solid rgba(167, 139, 250, 0.45);
+}
+
+.agent-popover-card--manus .agent-popover-tag {
+  color: #1e3a8a;
+  background: rgba(219, 234, 254, 0.95);
+  border: 1px solid rgba(96, 165, 250, 0.55);
+}
+
+.agent-popover-footer {
+  position: relative;
+  z-index: 1;
+  margin: 0 0 0.65rem;
+  font-size: 0.74rem;
+  font-weight: 650;
+  line-height: 1.45;
+  color: #3f3656;
+  padding: 0.45rem 0.55rem;
+  border-radius: 0.5rem;
+}
+
+/* 等价 Tailwind: w-full py-2 rounded-lg text-white font-medium hover:opacity-90 transition-all */
+.agent-popover-action {
+  position: relative;
+  z-index: 1;
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0 0 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border: none;
+  border-radius: 0.5rem;
+  font: inherit;
+  font-size: 0.84rem;
+  font-weight: 500;
+  line-height: 1.35;
+  color: #fff;
+  text-align: center;
+  cursor: pointer;
+  transition:
+    opacity 0.18s ease,
+    transform 0.18s ease,
+    box-shadow 0.18s ease;
+}
+
+@media (hover: hover) {
+  .agent-popover-action:hover {
+    opacity: 0.9;
+  }
+}
+
+.agent-popover-action:active {
+  transform: scale(0.99);
+}
+
+.agent-popover-action:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.85);
+  outline-offset: 2px;
+}
+
+.agent-popover-action--purple {
+  background: linear-gradient(145deg, #5b21b6, #7c3aed);
+  box-shadow: 0 4px 16px rgba(91, 33, 182, 0.42);
+}
+
+.agent-popover-action--blue {
+  background: linear-gradient(145deg, #1d4ed8, #2563eb);
+  box-shadow: 0 4px 16px rgba(29, 78, 216, 0.4);
+}
+
+.agent-popover-card--normal .agent-popover-footer {
+  color: #4c1d95;
+  background: linear-gradient(135deg, rgba(237, 233, 254, 0.9), rgba(221, 214, 254, 0.65));
+  border: 1px solid rgba(167, 139, 250, 0.35);
+}
+
+.agent-popover-card--manus .agent-popover-footer {
+  color: #1e40af;
+  background: linear-gradient(135deg, rgba(219, 234, 254, 0.95), rgba(191, 219, 254, 0.7));
+  border: 1px solid rgba(59, 130, 246, 0.35);
+}
+
+.agent-popover-hint {
+  position: relative;
+  z-index: 1;
+  margin: 0.1rem 0 0;
+  font-size: 0.6rem;
+  color: #9b8fc4;
+  text-align: center;
+}
+
+@media (prefers-color-scheme: dark) {
+  .agent-popover-backdrop {
+    background: rgba(2, 6, 23, 0.55);
+  }
+
+  .agent-popover-card {
+    background: rgba(30, 27, 46, 0.82);
+    color: #e9e4f4;
+  }
+
+  .agent-popover-title {
+    color: #f5f3ff;
+  }
+
+  .agent-popover-card--manus .agent-popover-title {
+    color: #dbeafe;
+  }
+
+  .agent-popover-card--normal .agent-popover-tag {
+    color: #ddd6fe;
+    background: rgba(76, 29, 149, 0.45);
+    border-color: rgba(167, 139, 250, 0.35);
+  }
+
+  .agent-popover-card--manus .agent-popover-tag {
+    color: #bfdbfe;
+    background: rgba(30, 58, 138, 0.55);
+    border-color: rgba(59, 130, 246, 0.4);
+  }
+
+  .agent-popover-card--normal .agent-popover-footer {
+    color: #e9d5ff;
+    background: linear-gradient(135deg, rgba(76, 29, 149, 0.5), rgba(67, 56, 102, 0.55));
+    border-color: rgba(167, 139, 250, 0.28);
+  }
+
+  .agent-popover-card--manus .agent-popover-footer {
+    color: #bfdbfe;
+    background: linear-gradient(135deg, rgba(30, 58, 138, 0.55), rgba(23, 37, 84, 0.55));
+    border-color: rgba(59, 130, 246, 0.3);
+  }
+
+  .agent-popover-hint {
+    color: #a8a4b8;
+  }
+
+  .agent-popover-action--purple {
+    background: linear-gradient(145deg, #6d28d9, #8b5cf6);
+    box-shadow: 0 4px 18px rgba(124, 58, 237, 0.35);
+  }
+
+  .agent-popover-action--blue {
+    background: linear-gradient(145deg, #2563eb, #3b82f6);
+    box-shadow: 0 4px 18px rgba(59, 130, 246, 0.38);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-popover-enter-active,
+  .agent-popover-leave-active {
+    transition-duration: 0.04s;
+  }
+
+  .agent-popover-card {
+    scroll-behavior: auto;
+  }
 }
 
 @media (max-width: 900px) {
