@@ -33,6 +33,8 @@ export interface ChatMessage {
   manusPendingFinalSummary?: string
   /** Manus：已开始终稿 reveal（避免重复启动） */
   manusFinalRevealStarted?: boolean
+  /** 流式首包前随机一条等待文案（按 mode 在发送时抽选，避免重渲染换句） */
+  streamingWaitHint?: string
   /** 本轮 SSE 是否已结束（成功 / 失败）；用于新发送前丢弃未完成气泡 */
   streamComplete?: boolean
   /** SSE 已读完，等逐字追平全文后再切 Markdown，避免长文/导出类内容整块蹦出 */
@@ -57,6 +59,23 @@ function createClientId(): string {
   return `id-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`
 }
 
+const NORMAL_STREAM_WAIT_HINTS = [
+  '正在思考中...',
+  '正在处理您的请求...',
+  '请稍等，信息马上呈现...',
+] as const
+
+const MANUS_STREAM_WAIT_HINTS = [
+  '脑细胞正在高速运转中 🧠⚡',
+  'Manus 正在全速奔跑中，马上就来！',
+  '正在为你精心准备大招...',
+] as const
+
+function pickStreamingWaitHint(mode: 'normal' | 'manus'): string {
+  const pool = mode === 'manus' ? MANUS_STREAM_WAIT_HINTS : NORMAL_STREAM_WAIT_HINTS
+  return pool[Math.floor(Math.random() * pool.length)]!
+}
+
 const userPrompt = ref('')
 const promptTrimmed = computed(() => userPrompt.value.trim())
 
@@ -71,14 +90,21 @@ const messages = ref<ChatMessage[]>([])
 let streamingAssistantIndex = -1
 let streamGeneration = 0
 
-const revealFinishing = computed(() => {
+/**
+ * 最后一条为助手且尚未标记完成：涵盖智选灵犀整段 SSE + 终稿 reveal，
+ * 以及 Manus 步进打字、收口、终稿 reveal，直到 `streamComplete` 为 true。
+ */
+const assistantReplyInFlight = computed(() => {
   const list = messages.value
   const m = list[list.length - 1]
-  return !!(m?.role === 'assistant' && m.pendingMarkdown)
+  return !!(m?.role === 'assistant' && !m.streamComplete)
 })
 
 const canSend = computed(
-  () => promptTrimmed.value.length > 0 && !loading.value && !revealFinishing.value
+  () =>
+    promptTrimmed.value.length > 0 &&
+    !loading.value &&
+    !assistantReplyInFlight.value
 )
 
 const feedWrap = ref<HTMLElement | null>(null)
@@ -510,6 +536,7 @@ async function startStream(presetPrompt?: string) {
       role: 'assistant',
       mode,
       content: '',
+      streamingWaitHint: pickStreamingWaitHint(mode),
       manusSteps: [],
       manusDone: false,
       ...(mode === 'manus'
@@ -526,6 +553,7 @@ async function startStream(presetPrompt?: string) {
   scrollFeedToEnd(true)
   revealShown.value = 0
   stopRevealRaf()
+  userPrompt.value = ''
 
   let gotFirst = false
   const markFirst = () => {
@@ -571,7 +599,6 @@ async function startStream(presetPrompt?: string) {
         finalizePendingMarkdownIfCaughtUp(doneA)
       }
     }
-    userPrompt.value = ''
   } catch (e) {
     if ((e as Error).name === 'AbortError') {
       if (gen === streamGeneration) loading.value = false
@@ -793,11 +820,9 @@ function streamPlainPreview(m: ChatMessage): string {
                 !(m.mode === 'manus' && m.manusPanelExpanded === false && !m.manusDone)
               "
             >
-              <span class="typing-row" aria-hidden="true">
-                <span class="typing-dots" aria-hidden="true">
-                  <span v-for="n in 6" :key="n" class="typing-dot">·</span>
-                </span>
-              </span>
+              <p class="assistant-wait-hint" role="status" aria-live="polite">
+                {{ m.streamingWaitHint ?? '请稍候…' }}
+              </p>
             </template>
             <template v-else-if="m.role === 'assistant' && !m.content && m.streamComplete">
               （暂无文字）
@@ -866,10 +891,10 @@ function streamPlainPreview(m: ChatMessage): string {
               type="button"
               class="send-btn"
               :disabled="!canSend"
-              :aria-label="loading ? '连接中' : '发送'"
+              :aria-label="loading || assistantReplyInFlight ? '处理中' : '发送'"
               @click="() => void startStream()"
             >
-              <span v-if="loading" class="send-spinner" aria-hidden="true" />
+              <span v-if="loading || assistantReplyInFlight" class="send-spinner" aria-hidden="true" />
               <span v-else class="send-icon" aria-hidden="true">➤</span>
             </button>
           </div>
@@ -1292,64 +1317,11 @@ function streamPlainPreview(m: ChatMessage): string {
   }
 }
 
-.typing-row {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 1.4em;
-  padding: 0.15rem 0;
-}
-
-.typing-dots {
-  display: inline-flex;
-  gap: 0.12em;
-  letter-spacing: 0;
-}
-
-.typing-dot {
-  display: inline-block;
-  width: 0.42em;
-  text-align: center;
-  font-weight: 800;
-  font-size: 1.35rem;
-  line-height: 1;
-  color: #4c1d95;
-  opacity: 0.35;
-  animation: dot-wave 1.1s ease-in-out infinite;
-}
-
-.typing-dot:nth-child(1) {
-  animation-delay: 0s;
-}
-
-.typing-dot:nth-child(2) {
-  animation-delay: 0.1s;
-}
-
-.typing-dot:nth-child(3) {
-  animation-delay: 0.2s;
-}
-
-.typing-dot:nth-child(4) {
-  animation-delay: 0.3s;
-}
-
-.typing-dot:nth-child(5) {
-  animation-delay: 0.4s;
-}
-
-.typing-dot:nth-child(6) {
-  animation-delay: 0.5s;
-}
-
-@keyframes dot-wave {
-  0%,
-  100% {
-    opacity: 0.22;
-  }
-  45% {
-    opacity: 1;
-  }
+.assistant-wait-hint {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: #5b4a7a;
 }
 
 .manus-panel {
