@@ -678,9 +678,6 @@ function streamPlainPreview(m: ChatMessage): string {
               <span class="logo-dot" aria-hidden="true" />
               <h1 class="topbar-title">WiseLink AI</h1>
             </div>
-            <p class="session" title="当前会话 ID">
-              <code>{{ sessionId }}</code>
-            </p>
           </div>
         </header>
 
@@ -942,7 +939,7 @@ function streamPlainPreview(m: ChatMessage): string {
 .topbar-inner {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 0.75rem;
 }
 
@@ -968,28 +965,6 @@ function streamPlainPreview(m: ChatMessage): string {
   font-weight: 700;
   letter-spacing: -0.02em;
   color: #2d1b4e;
-}
-
-.session {
-  margin: 0;
-  font-size: 0.65rem;
-  color: #7c6aa3;
-  text-align: right;
-  min-width: 0;
-}
-
-.session code {
-  display: inline-block;
-  max-width: min(14rem, 88vw);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  vertical-align: bottom;
-  font-size: 0.62rem;
-  background: rgba(76, 29, 149, 0.12);
-  padding: 0.2rem 0.5rem;
-  border-radius: 999px;
-  color: #4c1d95;
 }
 
 .chat-shell {
@@ -1647,22 +1622,19 @@ function streamPlainPreview(m: ChatMessage): string {
 }
 
 @media (max-width: 900px) {
+  /* 与宽屏一致：最外层不滚动，仅 .feed-wrap 内跟底，避免页面级滚动条不随气泡走 */
   .shell {
     max-width: 100%;
-    max-height: none;
     min-height: 100dvh;
-    overflow-x: hidden;
-    overflow-y: auto;
-    -webkit-overflow-scrolling: touch;
+    min-height: 100svh;
+    max-height: 100dvh;
+    max-height: 100svh;
+    overflow: hidden;
   }
 
   .chat-shell {
-    flex: 1 1 auto;
-    min-height: min(72dvh, 640px);
-  }
-
-  .chat-window {
-    max-height: none;
+    flex: 1;
+    min-height: 0;
   }
 }
 </style>
