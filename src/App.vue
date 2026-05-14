@@ -1,6 +1,11 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { renderAssistantMarkdown } from './utils/markdown'
+import {
+  manusOnlyHiddenStepsPending,
+  manusStepsDebugEntries,
+  manusStepsMainEntries,
+} from './utils/manusStepDisplay'
 import { buildChatUrl, consumeSseResponse, type SseMessage } from './utils/sse'
 
 export interface ManusStep {
@@ -17,6 +22,17 @@ export interface ChatMessage {
   content: string
   manusSteps?: ManusStep[]
   manusDone?: boolean
+  /**
+   * Manus：步事件区是否展开。发送后为 true。
+   * 收口策略（保守）：理想情况在 RUN_FINISHED·META 对应气泡播完后再收；`done` 到达且主列表已全部打字完成后也会收口（兜底）。
+   */
+  manusPanelExpanded?: boolean
+  /** Manus：主列表每条气泡已 reveal 字数（与 manusStepsMainEntries 顺序一致，选 B 排队打字机） */
+  manusMainRowRevealChars?: number[]
+  /** Manus：done 中的终稿；收口后才写入 content 并开始 reveal */
+  manusPendingFinalSummary?: string
+  /** Manus：已开始终稿 reveal（避免重复启动） */
+  manusFinalRevealStarted?: boolean
   /** 本轮 SSE 是否已结束（成功 / 失败）；用于新发送前丢弃未完成气泡 */
   streamComplete?: boolean
   /** SSE 已读完，等逐字追平全文后再切 Markdown，避免长文/导出类内容整块蹦出 */
@@ -182,6 +198,197 @@ function streamingAssistant(): ChatMessage | null {
   return null
 }
 
+/**
+ * Manus 步进面板收口（折叠）。
+ * - `done`：**必须**调用，作为保守兜底（`manusStepsHasRunFinishedMeta` 不可信为唯一条件）。
+ * - 日后若在 RUN_FINISHED·META 播完时提前收口，仍须在 `done` 再调一次（幂等），确保漏事件时也能收起。
+ */
+function collapseManusStepPanel(a: ChatMessage) {
+  if (a.mode === 'manus') {
+    a.manusPanelExpanded = false
+    void nextTick(() => scrollManusStepsOlToEnd(a.id, true))
+  }
+}
+
+/** 步事件主列表 `<ol class="steps">` 内层滚动跟底 */
+const manusStepsOlByMsgId = new Map<string, HTMLOListElement>()
+
+function setManusStepsOlRef(messageId: string, el: unknown) {
+  if (el instanceof HTMLOListElement) manusStepsOlByMsgId.set(messageId, el)
+  else manusStepsOlByMsgId.delete(messageId)
+}
+
+function scrollManusStepsOlToEnd(messageId: string, force: boolean) {
+  const el = manusStepsOlByMsgId.get(messageId)
+  if (!el) return
+  const gap = el.scrollHeight - el.scrollTop - el.clientHeight
+  if (!force && gap > 72) return
+  el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight)
+}
+
+/**
+ * 在 Vue 补丁 DOM 之后再滚；长气泡（单条 summary 很高）常见首帧 scrollHeight 未涨满，故连跟两帧 rAF。
+ * 步进打字播放阶段传 force=true，避免「假 gap」后永久不再跟底。
+ */
+function scheduleManusStepsInnerScroll(messageId: string, force = false) {
+  void nextTick(() => {
+    requestAnimationFrame(() => {
+      scrollManusStepsOlToEnd(messageId, force)
+      requestAnimationFrame(() => {
+        scrollManusStepsOlToEnd(messageId, force)
+      })
+    })
+  })
+}
+
+let manusStepRafId = 0
+
+function stopManusStepRaf() {
+  if (manusStepRafId) {
+    cancelAnimationFrame(manusStepRafId)
+    manusStepRafId = 0
+  }
+}
+
+function syncManusRevealLens(a: ChatMessage) {
+  if (a.mode !== 'manus') return
+  const n = manusStepsMainEntries(a.manusSteps).length
+  if (!a.manusMainRowRevealChars) a.manusMainRowRevealChars = []
+  const arr = a.manusMainRowRevealChars
+  while (arr.length < n) arr.push(0)
+}
+
+function allMainManusRowsTyped(a: ChatMessage): boolean {
+  const entries = manusStepsMainEntries(a.manusSteps)
+  const lens = a.manusMainRowRevealChars || []
+  for (let i = 0; i < entries.length; i++) {
+    const cap = (entries[i].step.summary || '').length
+    if ((lens[i] ?? 0) < cap) return false
+  }
+  return true
+}
+
+/** 当前条 Manus 助手是否仍处于「步进气泡打字」阶段（终稿 reveal 未启动） */
+function manusStepListIsTypingLive(m: ChatMessage): boolean {
+  const list = messages.value
+  const tail = list[list.length - 1]
+  return (
+    m.role === 'assistant' &&
+    m.mode === 'manus' &&
+    tail?.id === m.id &&
+    !m.streamComplete &&
+    !m.manusFinalRevealStarted
+  )
+}
+
+function manusMainRowCharCount(m: ChatMessage, rowIndex: number): number {
+  return m.manusMainRowRevealChars?.[rowIndex] ?? 0
+}
+
+function manusMainVisibleSummarySlice(m: ChatMessage, rowIndex: number, summary: string | undefined): string {
+  if (!summary) return ''
+  if (!manusStepListIsTypingLive(m)) return summary
+  const n = manusMainRowCharCount(m, rowIndex)
+  return summary.slice(0, n)
+}
+
+/** 当前行是否为「正在打字」的那一行（用于光标） */
+function manusStepRowShowsCaret(m: ChatMessage, rowIndex: number, summary: string | undefined): boolean {
+  if (!summary || !manusStepListIsTypingLive(m)) return false
+  const entries = manusStepsMainEntries(m.manusSteps)
+  const lens = m.manusMainRowRevealChars || []
+  let i = 0
+  for (; i < entries.length; i++) {
+    const cap = (entries[i].step.summary || '').length
+    if ((lens[i] ?? 0) < cap) break
+  }
+  return i === rowIndex && manusMainRowCharCount(m, rowIndex) < summary.length
+}
+
+function tryCollapseManusPanel(a: ChatMessage): boolean {
+  if (a.mode !== 'manus' || a.manusPanelExpanded === false) return false
+  const entries = manusStepsMainEntries(a.manusSteps)
+  if (!entries.length) {
+    if (a.manusDone) {
+      collapseManusStepPanel(a)
+      return true
+    }
+    return false
+  }
+  if (!allMainManusRowsTyped(a)) return false
+  const last = entries[entries.length - 1].step
+  const lastIsRf = last.phase === 'RUN_FINISHED' && last.messageType === 'META'
+  if (lastIsRf) {
+    collapseManusStepPanel(a)
+    return true
+  }
+  if (a.manusDone) {
+    collapseManusStepPanel(a)
+    return true
+  }
+  return false
+}
+
+function maybeStartManusFinalReveal(a: ChatMessage) {
+  if (a.mode !== 'manus' || a.manusFinalRevealStarted) return
+  if (a.manusPanelExpanded !== false) return
+  if (!a.manusDone) return
+  if (a.manusPendingFinalSummary === undefined) return
+
+  stopManusStepRaf()
+  a.manusFinalRevealStarted = true
+  const text = a.manusPendingFinalSummary
+  a.manusPendingFinalSummary = undefined
+  a.content = text
+  revealShown.value = 0
+  a.pendingMarkdown = true
+  a.streamComplete = false
+  bumpRevealPump()
+  scheduleFollowScroll()
+  void nextTick(() => scrollFeedToEnd(true))
+}
+
+function tryManusCollapseAndFinalReveal(a: ChatMessage) {
+  if (a.mode !== 'manus') return
+  tryCollapseManusPanel(a)
+  maybeStartManusFinalReveal(a)
+}
+
+function manusStepTick() {
+  manusStepRafId = 0
+  const a = streamingAssistant()
+  if (!a || a.mode !== 'manus' || a.manusFinalRevealStarted) return
+
+  syncManusRevealLens(a)
+  const entries = manusStepsMainEntries(a.manusSteps)
+  const lens = a.manusMainRowRevealChars!
+  let i = 0
+  for (; i < entries.length; i++) {
+    const cap = (entries[i].step.summary || '').length
+    if ((lens[i] ?? 0) < cap) break
+  }
+
+  if (i < entries.length) {
+    const cap = (entries[i].step.summary || '').length
+    const cur = lens[i] ?? 0
+    const behind = cap - cur
+    const step = Math.max(1, Math.min(3, Math.ceil(behind / 102)))
+    lens[i] = Math.min(cap, cur + step)
+    scheduleManusStepsInnerScroll(a.id, true)
+    tryManusCollapseAndFinalReveal(a)
+    manusStepRafId = requestAnimationFrame(manusStepTick)
+  } else {
+    tryManusCollapseAndFinalReveal(a)
+  }
+}
+
+function bumpManusStepPump() {
+  const a = streamingAssistant()
+  if (!a || a.mode !== 'manus' || a.manusFinalRevealStarted) return
+  if (manusStepRafId) return
+  manusStepRafId = requestAnimationFrame(manusStepTick)
+}
+
 function applyManusPayload(a: ChatMessage, payload: Record<string, unknown>) {
   if (!a.manusSteps) a.manusSteps = []
   const messageType =
@@ -196,9 +403,12 @@ function applyManusPayload(a: ChatMessage, payload: Record<string, unknown>) {
     raw: JSON.stringify(payload),
   })
 
-  if (messageType === 'MODEL' && summary) {
+  if (messageType === 'MODEL' && summary && a.mode !== 'manus') {
     a.content = summary
   }
+
+  syncManusRevealLens(a)
+  bumpManusStepPump()
 }
 
 function handleSseMessage(msg: SseMessage) {
@@ -221,24 +431,39 @@ function handleSseMessage(msg: SseMessage) {
         raw: msg.data,
         summary: msg.data.slice(0, 200),
       })
+      syncManusRevealLens(a)
+      bumpManusStepPump()
     }
-    bumpRevealPump()
     scheduleFollowScroll()
     return
   }
 
   if (msg.event === 'done') {
     a.manusDone = true
-    try {
-      const o = JSON.parse(msg.data) as Record<string, unknown>
-      const fs = o.finalSummary
-      if (typeof fs === 'string' && fs.trim()) {
-        a.content = fs
+    if (a.mode === 'manus') {
+      let pending = ''
+      try {
+        const o = JSON.parse(msg.data) as Record<string, unknown>
+        const fs = o.finalSummary
+        pending = typeof fs === 'string' ? fs : ''
+      } catch {
+        pending = ''
       }
-    } catch {
-      /* ignore */
+      a.manusPendingFinalSummary = pending
+      bumpManusStepPump()
+      tryManusCollapseAndFinalReveal(a)
+    } else {
+      try {
+        const o = JSON.parse(msg.data) as Record<string, unknown>
+        const fs = o.finalSummary
+        if (typeof fs === 'string' && fs.trim()) {
+          a.content = fs
+        }
+      } catch {
+        /* ignore */
+      }
+      bumpRevealPump()
     }
-    bumpRevealPump()
     scheduleFollowScroll()
   }
 }
@@ -250,8 +475,11 @@ function onPromptKeydown(e: KeyboardEvent) {
   if (canSend.value) void startStream()
 }
 
-async function startStream() {
-  const prompt = userPrompt.value.trim()
+async function startStream(presetPrompt?: string) {
+  const prompt =
+    presetPrompt != null && String(presetPrompt).trim() !== ''
+      ? String(presetPrompt).trim()
+      : userPrompt.value.trim()
   if (!prompt) {
     error.value = '请先输入要发送的内容。'
     return
@@ -261,6 +489,7 @@ async function startStream() {
 
   abort?.abort()
   abort = new AbortController()
+  stopManusStepRaf()
 
   const list = messages.value
   const tail = list[list.length - 1]
@@ -283,6 +512,13 @@ async function startStream() {
       content: '',
       manusSteps: [],
       manusDone: false,
+      ...(mode === 'manus'
+        ? {
+            manusPanelExpanded: true as const,
+            manusMainRowRevealChars: [] as number[],
+            manusFinalRevealStarted: false as const,
+          }
+        : {}),
       streamComplete: false,
     }
   )
@@ -296,7 +532,8 @@ async function startStream() {
     if (!gotFirst) {
       gotFirst = true
       loading.value = false
-      bumpRevealPump()
+      const cur = streamingAssistant()
+      if (cur?.mode !== 'manus') bumpRevealPump()
     }
   }
 
@@ -325,9 +562,14 @@ async function startStream() {
     markFirst()
     const doneA = streamingAssistant()
     if (doneA) {
-      doneA.pendingMarkdown = true
-      bumpRevealPump()
-      finalizePendingMarkdownIfCaughtUp(doneA)
+      if (doneA.mode === 'manus') {
+        bumpManusStepPump()
+        tryManusCollapseAndFinalReveal(doneA)
+      } else {
+        doneA.pendingMarkdown = true
+        bumpRevealPump()
+        finalizePendingMarkdownIfCaughtUp(doneA)
+      }
     }
     userPrompt.value = ''
   } catch (e) {
@@ -339,6 +581,7 @@ async function startStream() {
     error.value = msg
     const a = streamingAssistant()
     if (a) {
+      if (a.mode === 'manus') stopManusStepRaf()
       if (!a.content.trim()) {
         a.content = `（请求失败：${msg}）`
       }
@@ -352,39 +595,17 @@ async function startStream() {
   scrollFeedToEnd(true)
 }
 
-function sealIncompleteAssistantBubble() {
-  const list = messages.value
-  const idx = streamingAssistantIndex
-  if (idx < 0) return
-  const m = list[idx]
-  if (!m || m.role !== 'assistant' || m.streamComplete) return
-  m.pendingMarkdown = false
-  m.streamComplete = true
-  if (!m.content.trim()) {
-    m.content = '（已切换视图，本次回复中断）'
-  }
-}
-
-watch(activeTab, () => {
-  sealIncompleteAssistantBubble()
-  streamGeneration++
-  abort?.abort()
-  stopRevealRaf()
-  cancelFollowScroll()
-  revealShown.value = 0
-  streamingAssistantIndex = -1
-  loading.value = false
-  error.value = null
-})
-
-const progressOpen = ref(true)
 const isNarrow = ref(false)
 
 const mq = typeof window !== 'undefined' ? window.matchMedia('(max-width: 900px)') : null
 function syncMq() {
   if (!mq) return
   isNarrow.value = mq.matches
-  if (mq.matches) progressOpen.value = false
+}
+
+function toggleManusPanel(m: ChatMessage) {
+  const cur = m.manusPanelExpanded !== false
+  m.manusPanelExpanded = !cur
 }
 onMounted(() => {
   sessionId.value = createClientId()
@@ -396,6 +617,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   abort?.abort()
   stopRevealRaf()
+  stopManusStepRaf()
   cancelFollowScroll()
   mq?.removeEventListener('change', syncMq)
 })
@@ -403,6 +625,12 @@ onBeforeUnmount(() => {
 const tabLabel = computed(() =>
   activeTab.value === 'normal' ? '智选灵犀' : 'Manus'
 )
+
+const starterSuggestions = [
+  '你能做些什么?',
+  '我可以问哪些类型的问题?',
+  '帮我理清思路、算清账、避风险',
+] as const
 
 function assistantHtml(content: string): string {
   return renderAssistantMarkdown(content)
@@ -431,9 +659,25 @@ function streamPlainPreview(m: ChatMessage): string {
 
         <div ref="feedWrap" class="feed-wrap">
           <div class="feed">
-            <p v-if="messages.length === 0" class="welcome">
-              输入问题后发送，助手回复会出现在这里。
-            </p>
+            <template v-if="messages.length === 0">
+              <div class="onboarding-spacer" aria-hidden="true" />
+              <section class="empty-onboarding" aria-label="开场引导">
+                <p class="empty-greeting">
+                  Hi~，我是你的专属导购<span class="greet-brand">WiseLink</span>
+                </p>
+                <div class="starter-chips" role="group" aria-label="快捷建议">
+                  <button
+                    v-for="t in starterSuggestions"
+                    :key="t"
+                    type="button"
+                    class="starter-chip"
+                    @click="void startStream(t)"
+                  >
+                    {{ t }}
+                  </button>
+                </div>
+              </section>
+            </template>
 
             <div
               v-for="m in messages"
@@ -445,13 +689,108 @@ function streamPlainPreview(m: ChatMessage): string {
             {{ m.role === 'user' ? '你' : '助手' }}
             <span v-if="m.role === 'assistant'" class="mode-tag">{{ m.mode === 'normal' ? '智选灵犀' : 'Manus' }}</span>
           </div>
+          <div
+            v-if="m.role === 'assistant' && m.mode === 'manus' && (m.manusSteps?.length || m.manusDone)"
+            class="manus-panel"
+          >
+            <button
+              type="button"
+              class="manus-toggle"
+              @click="toggleManusPanel(m)"
+            >
+              {{ m.manusPanelExpanded !== false ? '收起' : '展开' }}步进
+              <span class="chev">{{ m.manusPanelExpanded !== false ? '▾' : '▸' }}</span>
+            </button>
+            <div
+              class="manus-steps card-inset"
+              :class="{ collapsed: m.manusPanelExpanded === false }"
+            >
+              <p class="manus-steps-title">步事件 <code>manus</code></p>
+              <ol
+                v-if="manusStepsMainEntries(m.manusSteps).length"
+                :ref="(el) => setManusStepsOlRef(m.id, el)"
+                class="steps"
+              >
+                <li
+                  v-for="(ent, rowIndex) in manusStepsMainEntries(m.manusSteps)"
+                  :key="`${m.id}-main-${ent.idx}`"
+                  class="step"
+                >
+                  <div class="step-head">
+                    <span v-if="ent.step.phase" class="pill phase">{{ ent.step.phase }}</span>
+                    <span v-if="ent.step.messageType" class="pill type">{{ ent.step.messageType }}</span>
+                  </div>
+                  <p v-if="ent.step.summary" class="step-summary">
+                    {{ manusMainVisibleSummarySlice(m, rowIndex, ent.step.summary) }}<span
+                      v-if="manusStepRowShowsCaret(m, rowIndex, ent.step.summary)"
+                      class="stream-caret"
+                      aria-hidden="true"
+                    >▎</span>
+                  </p>
+                  <details v-else class="raw-wrap">
+                    <summary>原始数据</summary>
+                    <pre class="raw">{{ ent.step.raw }}</pre>
+                  </details>
+                </li>
+              </ol>
+              <p
+                v-else-if="manusOnlyHiddenStepsPending(m.manusSteps, !!m.manusDone)"
+                class="empty"
+              >
+                处理中…
+              </p>
+              <p v-else-if="!m.manusSteps?.length" class="empty">暂无步事件</p>
+              <p v-else-if="manusStepsDebugEntries(m.manusSteps).length" class="empty empty-muted">
+                辅助信息已收起到下方「更多 / 调试」
+              </p>
+              <p v-else class="empty empty-muted">暂无对客展示的步事件</p>
+              <details
+                v-if="manusStepsDebugEntries(m.manusSteps).length"
+                class="manus-debug"
+              >
+                <summary>更多 / 调试</summary>
+                <ol class="steps steps-debug">
+                  <li
+                    v-for="{ step: s, idx } in manusStepsDebugEntries(m.manusSteps)"
+                    :key="`${m.id}-dbg-${idx}`"
+                    class="step step-debug"
+                  >
+                    <div class="step-head">
+                      <span v-if="s.phase" class="pill phase">{{ s.phase }}</span>
+                      <span v-if="s.messageType" class="pill type">{{ s.messageType }}</span>
+                    </div>
+                    <p v-if="s.summary" class="step-summary">{{ s.summary }}</p>
+                    <details class="raw-wrap">
+                      <summary>原始数据</summary>
+                      <pre class="raw">{{ s.raw }}</pre>
+                    </details>
+                  </li>
+                </ol>
+              </details>
+              <p v-if="m.manusDone" class="done-tag">已收到 <code>done</code></p>
+            </div>
+          </div>
           <div class="msg-bubble">
             <template
               v-if="
                 m.role === 'assistant' &&
+                m.mode === 'manus' &&
                 !m.streamComplete &&
                 m.id === messages[messages.length - 1]?.id &&
-                !m.content
+                !m.content &&
+                m.manusPanelExpanded === false &&
+                !m.manusDone
+              "
+            >
+              <p class="manus-wait-tail">等待回复结束…</p>
+            </template>
+            <template
+              v-else-if="
+                m.role === 'assistant' &&
+                !m.streamComplete &&
+                m.id === messages[messages.length - 1]?.id &&
+                !m.content &&
+                !(m.mode === 'manus' && m.manusPanelExpanded === false && !m.manusDone)
               "
             >
               <span class="typing-row" aria-hidden="true">
@@ -481,41 +820,6 @@ function streamPlainPreview(m: ChatMessage): string {
             </template>
           </div>
 
-          <div
-            v-if="m.role === 'assistant' && m.mode === 'manus' && (m.manusSteps?.length || m.manusDone)"
-            class="manus-panel"
-          >
-            <button
-              v-if="isNarrow"
-              type="button"
-              class="manus-toggle"
-              @click="progressOpen = !progressOpen"
-            >
-              {{ progressOpen ? '收起' : '展开' }}步进
-              <span class="chev">{{ progressOpen ? '▾' : '▸' }}</span>
-            </button>
-            <div
-              class="manus-steps card-inset"
-              :class="{ collapsed: isNarrow && !progressOpen }"
-            >
-              <p class="manus-steps-title">步事件 <code>manus</code></p>
-              <ol v-if="m.manusSteps?.length" class="steps">
-                <li v-for="(s, i) in m.manusSteps" :key="i" class="step">
-                  <div class="step-head">
-                    <span v-if="s.phase" class="pill phase">{{ s.phase }}</span>
-                    <span v-if="s.messageType" class="pill type">{{ s.messageType }}</span>
-                  </div>
-                  <p v-if="s.summary" class="step-summary">{{ s.summary }}</p>
-                  <details v-else class="raw-wrap">
-                    <summary>原始数据</summary>
-                    <pre class="raw">{{ s.raw }}</pre>
-                  </details>
-                </li>
-              </ol>
-              <p v-else class="empty">暂无步事件</p>
-              <p v-if="m.manusDone" class="done-tag">已收到 <code>done</code></p>
-            </div>
-          </div>
             </div>
 
             <div v-if="error" class="alert" role="alert">
@@ -555,7 +859,6 @@ function streamPlainPreview(m: ChatMessage): string {
               class="composer-input"
               rows="1"
               placeholder="输入你的问题…"
-              :readonly="loading"
               spellcheck="false"
               @keydown="onPromptKeydown"
             />
@@ -564,7 +867,7 @@ function streamPlainPreview(m: ChatMessage): string {
               class="send-btn"
               :disabled="!canSend"
               :aria-label="loading ? '连接中' : '发送'"
-              @click="startStream"
+              @click="() => void startStream()"
             >
               <span v-if="loading" class="send-spinner" aria-hidden="true" />
               <span v-else class="send-icon" aria-hidden="true">➤</span>
@@ -705,14 +1008,70 @@ function streamPlainPreview(m: ChatMessage): string {
   flex-direction: column;
   gap: 1rem;
   padding-bottom: 0.35rem;
+  min-height: min(70vh, 28rem);
 }
 
-.welcome {
-  margin: 1.5rem 0 0;
-  text-align: center;
-  font-size: 0.95rem;
-  color: #5c4d78;
-  line-height: 1.5;
+.onboarding-spacer {
+  flex: 1 1 auto;
+  min-height: 1.5rem;
+}
+
+.empty-onboarding {
+  flex-shrink: 0;
+  align-self: flex-start;
+  max-width: min(100%, 22rem);
+  padding: 0 0.15rem 0.5rem;
+}
+
+.empty-greeting {
+  margin: 0 0 1rem;
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.45;
+  color: #2d1b4e;
+}
+
+.greet-brand {
+  color: #2d1b4e;
+  font-weight: 800;
+}
+
+.starter-chips {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.55rem;
+}
+
+.starter-chip {
+  text-align: left;
+  width: fit-content;
+  max-width: min(100%, 22rem);
+  box-sizing: border-box;
+  white-space: normal;
+  border: 1px solid rgba(42, 8, 72, 0.1);
+  border-radius: 999px;
+  padding: 0.55rem 1rem;
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: #2d1b4e;
+  background: linear-gradient(180deg, #f3f0fa 0%, #ebe6f5 100%);
+  box-shadow: 0 1px 2px rgba(42, 8, 72, 0.06);
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    box-shadow 0.15s,
+    transform 0.12s;
+}
+
+.starter-chip:hover {
+  background: linear-gradient(180deg, #faf8ff 0%, #f0ebfb 100%);
+  box-shadow: 0 2px 8px rgba(76, 29, 149, 0.12);
+}
+
+.starter-chip:active {
+  transform: scale(0.99);
 }
 
 .msg-row {
@@ -1090,6 +1449,17 @@ function streamPlainPreview(m: ChatMessage): string {
   color: #3f365f;
 }
 
+.step-summary .stream-caret {
+  font-size: 0.72rem;
+  vertical-align: text-bottom;
+}
+
+.manus-wait-tail {
+  margin: 0;
+  font-size: 0.88rem;
+  color: #6b5f8a;
+}
+
 .raw-wrap summary {
   cursor: pointer;
   font-size: 0.72rem;
@@ -1109,6 +1479,33 @@ function streamPlainPreview(m: ChatMessage): string {
   margin: 0;
   font-size: 0.8rem;
   color: #9b8fc4;
+}
+
+.empty.empty-muted {
+  font-size: 0.75rem;
+  color: #a8a0c2;
+}
+
+.manus-debug {
+  margin-top: 0.65rem;
+  padding-top: 0.5rem;
+  border-top: 1px dashed rgba(42, 8, 72, 0.12);
+}
+
+.manus-debug > summary {
+  cursor: pointer;
+  font-size: 0.72rem;
+  font-weight: 650;
+  color: #6d28d9;
+}
+
+.steps-debug {
+  margin-top: 0.45rem;
+  max-height: min(32vh, 220px);
+}
+
+.step-debug .step-summary {
+  font-size: 0.78rem;
 }
 
 .done-tag {
@@ -1198,11 +1595,6 @@ function streamPlainPreview(m: ChatMessage): string {
 
 .composer-input::placeholder {
   color: #a39bb8;
-}
-
-.composer-input:read-only {
-  opacity: 0.72;
-  cursor: wait;
 }
 
 .composer-input:disabled {
@@ -1299,16 +1691,6 @@ function streamPlainPreview(m: ChatMessage): string {
 
   .chat-window {
     max-height: none;
-  }
-}
-
-@media (min-width: 901px) {
-  .manus-toggle {
-    display: none;
-  }
-
-  .manus-steps.collapsed {
-    display: block;
   }
 }
 </style>
