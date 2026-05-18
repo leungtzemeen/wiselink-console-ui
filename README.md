@@ -1,33 +1,112 @@
-# wiselink-console-ui
+# WiseLink Console UI
 
-Vue 3 + Vite + TypeScript 控制台前端，内含 **面试演示用** SSE 单页：`fetch` + `ReadableStream` 解析 `text/event-stream`（智选灵犀与 Manus 两种 Tab）。
+WiseLink AI 对话控制台前端：基于 **Vue 3 + Vite + TypeScript**，对接 Java 后端的 **SSE（`text/event-stream`）** 流式接口，支持 **智选灵犀**（导购对话）与 **Manus**（多步执行、步进事件展示）两种模式。适用于产品演示、本地联调与容器化部署。
 
-## 环境变量
+## 功能特性
 
-复制 `.env.example` 为 `.env` 或 `.env.local` 后按需修改。
+- **双模式对话**：Tab 切换「智选灵犀 / Manus」，共用同一会话时间线（`sessionId`）。
+- **自研 SSE 消费**：使用 `fetch` + `ReadableStream` 解析 SSE 帧（非 `EventSource`），支持首包回调与 `AbortController` 取消竞态。
+- **流式打字机展示**：普通模式逐字 reveal；Manus 模式对步进 `summary` 排队打字，终稿完成后再切换 Markdown，避免长文整块蹦出。
+- **Manus 步进面板**：主列表 / 调试区折叠、面板收起策略、`RUN_FINISHED·META` 与 `done` 兜底收口、步进列表内层自动跟滚。
+- **助手 Markdown 渲染**：`marked` 解析 + `DOMPurify` 消毒后 `v-html` 展示。
+- **Agent 介绍 Popover**：头像唤起技能卡片、一键填入快捷 prompt（含 iOS/Android 同步 `focus` + 延迟滚动，保证软键盘唤起）。
+- **移动端友好**：Vite `host: true` 支持局域网调试；非安全上下文下 `crypto.randomUUID` 降级方案。
 
-- 示例值：`VITE_API_BASE=http://localhost:8081/api`
-- **生产**（Nginx 同域）：构建前改为 `VITE_API_BASE=https://wiselink.wiki/api`（与静态站同源下的 `/api` 路径一致即可）。
-- **本地跨域**：`vite.config.ts` 已将 `/api` 代理到 `http://localhost:8081`。可在 `.env.local` 中设置 `VITE_API_BASE=/api`，前端请求走同源 `/api/...`，由 Vite 转发到 Java，无需后端开 CORS。
+## 技术栈
 
-仓库内 **不要** 提交任何 API Key；本演示仅使用 `prompt` + `sessionId` 查询参数。
+| 类别 | 技术 |
+|------|------|
+| 框架 | [Vue 3](https://vuejs.org/)（Composition API + `<script setup>`） |
+| 构建 | [Vite 8](https://vite.dev/) + [TypeScript](https://www.typescriptlang.org/) + `vue-tsc` |
+| 内容 | [marked](https://marked.js.org/) + [DOMPurify](https://github.com/cure53/DOMPurify) |
+| 部署 | 多阶段 **Docker**（Node 构建 + Nginx 静态托管） |
 
-## 常用命令
+## 架构概览
+
+```
+src/
+├── App.vue                 # 页面壳：组合 composables + 子组件
+├── components/             # UI 组件
+│   ├── ChatLayout.vue      # shell / chat-window / 页脚
+│   ├── ChatHeader.vue
+│   ├── ChatComposer.vue    # Tab + 输入 + 发送（defineModel）
+│   ├── ChatMessageItem.vue # 单条消息 + Markdown / 流式预览
+│   ├── ManusStepsPanel.vue # Manus 步进区
+│   └── AgentPopover.vue    # Teleport 技能弹层
+├── composables/
+│   ├── useChatService.ts   # SSE fetch、会话消息、错误处理
+│   ├── useTypewriter.ts    # 打字机 reveal、Manus 步进动画
+│   ├── useAutoScroll.ts    # 主列表 / 步进 ol 跟滚（双 rAF）
+│   └── useAgentPopover.ts  # Popover 定位与快捷 prompt
+├── chat/
+│   └── chatSseStrategies.ts  # normal / manus SSE 策略（开闭原则，可横向扩展）
+├── types/chat.ts           # 消息类型、常量池
+├── utils/
+│   ├── sse.ts              # SSE 解析、buildChatUrl
+│   ├── markdown.ts
+│   └── manusStepDisplay.ts # 步进主列表 / 调试区分流
+└── styles/chat-feed.css    # 消息流、空状态、错误条
+```
+
+**设计要点**：SSE 核心循环与模式解析解耦（`ChatSseModeStrategy`）；UI 与滚动、打字机、网络层分 composable 维护，便于扩展第三种模式（如 search）。
+
+## 与后端约定
+
+- **智选灵犀**：`GET {VITE_API_BASE}/ai/chat?prompt=&sessionId=`，SSE 正文在 `data` 字段增量拼接。
+- **Manus**：`GET {VITE_API_BASE}/ai/chat/manus?...`，事件类型包括：
+  - `event: manus` — JSON 步进 payload（`phase` / `summary` / `messageType` 等）
+  - `event: done` — JSON 终稿（`finalSummary`）
+- 仓库内 **不要** 提交 API Key；鉴权若由网关处理，前端仅传 `prompt` + `sessionId`。
+
+## 本地开发
+
+### 环境变量
+
+复制 `.env.example` 为 `.env` 或 `.env.local`：
+
+```bash
+# 推荐：走 Vite 同源代理，手机用 http://<电脑局域网IP>:5173 访问时也能转发到本机 Java
+VITE_API_BASE=/api
+```
+
+- `vite.config.ts` 已将 `/api` 代理到 `http://127.0.0.1:8081`（`changeOrigin: true`）。
+- **勿** 在手机调试时把 `VITE_API_BASE` 写成 `http://192.168.x.x:8081`，否则请求会直连后端端口，易被防火墙 / CORS 拦截。
+- 生产构建同域示例：`VITE_API_BASE=https://your-domain.com/api`（须与 Nginx `location /api/` 前缀一致）。
+
+### 常用命令
 
 ```bash
 pnpm i
-pnpm dev
-pnpm build
+pnpm dev      # 开发服务器，默认 http://localhost:5173
+pnpm build    # vue-tsc + vite build → dist/
+pnpm preview  # 本地预览 dist
 ```
 
-- `pnpm dev`：启动开发服务器（默认带 `/api` → `http://localhost:8081` 代理）。
-- `pnpm build`：类型检查并产出 `dist/` 静态资源。
+## Docker 部署
 
-预览构建结果：`pnpm preview`。
+仓库提供多阶段镜像：Node 22 构建 → Nginx Alpine 托管静态资源，并挂载仓库内 [`nginx.conf`](./nginx.conf)。
 
-## Nginx 同域部署（静态站 + `/api` 反代到 Java）
+```bash
+# 构建前请设置生产 API 前缀（写入构建产物）
+# 例如 Docker 同域反代：VITE_API_BASE=/api
+docker build -t wiselink-console-ui .
 
-静态文件指向构建产物目录，并将 API 前缀反代到后端，例如：
+docker run --rm -p 8080:80 \
+  --network <与后端同一网络> \
+  wiselink-console-ui
+```
+
+容器内 Nginx 行为（见 `nginx.conf`）：
+
+- `/` — SPA，`try_files` 回退 `index.html`
+- `/api/` — 反代至 `http://wiselink-server:8081`（**请与后端容器服务名或 Compose 网络对齐**）
+- `proxy_buffering off` — **必须**，否则 SSE 流式打字会被缓冲
+
+> 本地开发用 `pnpm`；镜像构建阶段使用 `npm`（见 Dockerfile）。二者脚本一致（`npm run build`）。
+
+## 生产 Nginx（非 Docker / 宿主机直挂 dist）
+
+静态目录指向 `dist/`，API 前缀反代到 Java。流式接口请关闭代理缓冲：
 
 ```nginx
 server {
@@ -38,12 +117,14 @@ server {
     index index.html;
 
     location /api/ {
-        proxy_pass http://127.0.0.1:8081/api/;
+        proxy_pass http://127.0.0.1:8081;   # 或 http://127.0.0.1:8081/api/，与后端路由一致即可
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;
+        proxy_cache off;
     }
 
     location / {
@@ -52,8 +133,8 @@ server {
 }
 ```
 
-构建时使用 `VITE_API_BASE=https://wiselink.wiki/api`（或与 `location /api/` 一致的前缀），这样前端请求与页面同源，由 Nginx 将 `/api` 转到 Java 服务。
+构建时设置：`VITE_API_BASE=https://wiselink.wiki/api`（与页面同源下的 `/api` 路径一致）。
 
-## 技术栈
+## 许可证
 
-- [Vue 3](https://vuejs.org/) + [Vite](https://vite.dev/) + [TypeScript](https://www.typescriptlang.org/)
+私有项目；对外展示代码前请确认与团队策略一致。
