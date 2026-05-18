@@ -28,7 +28,7 @@ const feedWrap = autoScroll.feedWrap
 void feedWrap
 const { setManusStepsOlRef, cancelFollowScroll } = autoScroll
 const typewriter = useTypewriter(messages, streamingAssistantIndex, autoScroll)
-const { startStream, dispose: disposeChatFetch } = useChatService({
+const { startStream, stopStream, dispose: disposeChatFetch } = useChatService({
   messages,
   userPrompt,
   activeTab,
@@ -171,6 +171,7 @@ const starterSuggestions = [
         :tab-label="tabLabel"
         :is-narrow="isNarrow"
         @send="onComposerSend"
+        @stop="stopStream"
       />
     </template>
   </ChatLayout>

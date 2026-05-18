@@ -29,9 +29,34 @@ export interface ChatServiceDeps {
   }
 }
 
+function isAbortError(e: unknown): boolean {
+  return e instanceof DOMException && e.name === 'AbortError'
+}
+
 export function useChatService(deps: ChatServiceDeps) {
   let streamGeneration = 0
   let abort: AbortController | null = null
+
+  /** 保留已生成内容，结束 UI 流式态并停掉打字机 / Manus 步进动画 */
+  function finalizeStoppedStream(assistant: ChatMessage) {
+    deps.typewriter.stopManusStepRaf()
+    deps.typewriter.stopRevealRaf()
+    assistant.pendingMarkdown = false
+    assistant.streamComplete = true
+    deps.typewriter.revealShown.value = assistant.content.length
+  }
+
+  function stopStream() {
+    const assistant = deps.typewriter.streamingAssistant()
+    if (!assistant || assistant.streamComplete) return
+
+    abort?.abort()
+    abort = null
+    streamGeneration++
+    finalizeStoppedStream(assistant)
+    deps.loading.value = false
+    deps.scroll.scrollFeedToEnd(true)
+  }
 
   async function startStream(presetPrompt?: string) {
     const prompt =
@@ -47,6 +72,7 @@ export function useChatService(deps: ChatServiceDeps) {
 
     abort?.abort()
     abort = new AbortController()
+    const signal = abort.signal
     deps.typewriter.stopManusStepRaf()
 
     const list = deps.messages.value
@@ -106,7 +132,7 @@ export function useChatService(deps: ChatServiceDeps) {
       const res = await fetch(url, {
         method: 'GET',
         headers: { Accept: 'text/event-stream' },
-        signal: abort.signal,
+        signal,
         cache: 'no-store',
       })
 
@@ -117,7 +143,10 @@ export function useChatService(deps: ChatServiceDeps) {
           deps.typewriter.handleSseMessage(m)
         },
         markFirst,
+        signal,
       )
+
+      if (gen !== streamGeneration) return
 
       markFirst()
       const doneA = deps.typewriter.streamingAssistant()
@@ -132,10 +161,18 @@ export function useChatService(deps: ChatServiceDeps) {
         }
       }
     } catch (e) {
-      if ((e as Error).name === 'AbortError') {
-        if (gen === streamGeneration) deps.loading.value = false
+      if (isAbortError(e)) {
+        if (gen === streamGeneration) {
+          const a = deps.typewriter.streamingAssistant()
+          if (a && !a.streamComplete) {
+            finalizeStoppedStream(a)
+          }
+          deps.loading.value = false
+        }
         return
       }
+      if (gen !== streamGeneration) return
+
       const msg = e instanceof Error ? e.message : String(e)
       deps.error.value = msg
       const a = deps.typewriter.streamingAssistant()
@@ -151,15 +188,18 @@ export function useChatService(deps: ChatServiceDeps) {
       deps.loading.value = false
     }
 
-    deps.scroll.scrollFeedToEnd(true)
+    if (gen === streamGeneration) {
+      deps.scroll.scrollFeedToEnd(true)
+    }
   }
 
   function dispose() {
-    abort?.abort()
+    stopStream()
   }
 
   return {
     startStream,
+    stopStream,
     dispose,
   }
 }

@@ -2,7 +2,7 @@
 const userPrompt = defineModel<string>('userPrompt', { required: true })
 const activeTab = defineModel<'normal' | 'manus'>('activeTab', { required: true })
 
-defineProps<{
+const props = defineProps<{
   canSend: boolean
   loading: boolean
   assistantReplyInFlight: boolean
@@ -12,12 +12,25 @@ defineProps<{
 
 const emit = defineEmits<{
   send: []
+  stop: []
 }>()
+
+function onPrimaryAction() {
+  if (props.assistantReplyInFlight) {
+    emit('stop')
+    return
+  }
+  emit('send')
+}
 
 function onPromptKeydown(e: KeyboardEvent) {
   if (e.key !== 'Enter') return
   if (!(e.ctrlKey || e.metaKey)) return
   e.preventDefault()
+  if (props.assistantReplyInFlight) {
+    emit('stop')
+    return
+  }
   emit('send')
 }
 </script>
@@ -60,11 +73,19 @@ function onPromptKeydown(e: KeyboardEvent) {
       <button
         type="button"
         class="send-btn"
-        :disabled="!canSend"
-        :aria-label="loading || assistantReplyInFlight ? '处理中' : '发送'"
-        @click="emit('send')"
+        :class="{ 'send-btn--stop': assistantReplyInFlight }"
+        :disabled="!assistantReplyInFlight && !canSend"
+        :aria-label="
+          assistantReplyInFlight ? '停止生成' : loading ? '处理中' : '发送'
+        "
+        @click="onPrimaryAction"
       >
-        <span v-if="loading || assistantReplyInFlight" class="send-spinner" aria-hidden="true" />
+        <span
+          v-if="assistantReplyInFlight"
+          class="stop-icon"
+          aria-hidden="true"
+        />
+        <span v-else-if="loading" class="send-spinner" aria-hidden="true" />
         <span v-else class="send-icon" aria-hidden="true">➤</span>
       </button>
     </div>
@@ -176,6 +197,23 @@ function onPromptKeydown(e: KeyboardEvent) {
   opacity: 0.45;
   cursor: not-allowed;
   box-shadow: none;
+}
+
+.send-btn--stop {
+  background: linear-gradient(145deg, #7f1d1d, #b91c1c);
+  box-shadow: 0 4px 16px rgba(185, 28, 28, 0.4);
+}
+
+.send-btn--stop:hover:not(:disabled) {
+  transform: scale(1.04);
+}
+
+.stop-icon {
+  width: 0.85rem;
+  height: 0.85rem;
+  border-radius: 0.15rem;
+  background: currentColor;
+  display: block;
 }
 
 .send-icon {

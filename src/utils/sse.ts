@@ -27,10 +27,17 @@ function parseSseBlock(block: string): SseMessage | null {
  * Consume a fetch Response body as SSE (text/event-stream) using ReadableStream.
  * Invokes onMessage for each complete SSE frame; onFirstChunk on first body chunk.
  */
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw new DOMException('Aborted', 'AbortError')
+  }
+}
+
 export async function consumeSseResponse(
   response: Response,
   onMessage: (msg: SseMessage) => void,
-  onFirstChunk?: () => void
+  onFirstChunk?: () => void,
+  signal?: AbortSignal,
 ): Promise<void> {
   if (!response.ok) {
     const t = await response.text().catch(() => '')
@@ -41,32 +48,60 @@ export async function consumeSseResponse(
   if (!body) throw new Error('响应无 body')
 
   const reader = body.getReader()
+  const cancelReader = () => {
+    void reader.cancel().catch(() => {})
+  }
+
+  if (signal) {
+    if (signal.aborted) {
+      cancelReader()
+      throw new DOMException('Aborted', 'AbortError')
+    }
+    signal.addEventListener('abort', cancelReader, { once: true })
+  }
+
   const decoder = new TextDecoder()
   let buffer = ''
   let first = false
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    if (!first && value?.length) {
-      first = true
-      onFirstChunk?.()
-    }
-    buffer += decoder.decode(value, { stream: true })
+  try {
+    while (true) {
+      throwIfAborted(signal)
+      const { done, value } = await reader.read()
+      if (done) break
+      throwIfAborted(signal)
+      if (!first && value?.length) {
+        first = true
+        onFirstChunk?.()
+      }
+      buffer += decoder.decode(value, { stream: true })
 
-    let sep: number
-    while ((sep = findDoubleNewline(buffer)) !== -1) {
-      const raw = buffer.slice(0, sep)
-      buffer = buffer.slice(delimiterEnd(buffer, sep))
-      const msg = parseSseBlock(raw)
+      let sep: number
+      while ((sep = findDoubleNewline(buffer)) !== -1) {
+        const raw = buffer.slice(0, sep)
+        buffer = buffer.slice(delimiterEnd(buffer, sep))
+        const msg = parseSseBlock(raw)
+        if (msg) onMessage(msg)
+      }
+    }
+
+    throwIfAborted(signal)
+
+    const tail = buffer.trim()
+    if (tail) {
+      const msg = parseSseBlock(tail)
       if (msg) onMessage(msg)
     }
-  }
-
-  const tail = buffer.trim()
-  if (tail) {
-    const msg = parseSseBlock(tail)
-    if (msg) onMessage(msg)
+  } catch (e) {
+    if (signal?.aborted || (e instanceof DOMException && e.name === 'AbortError')) {
+      cancelReader()
+      throw new DOMException('Aborted', 'AbortError')
+    }
+    throw e
+  } finally {
+    if (signal) {
+      signal.removeEventListener('abort', cancelReader)
+    }
   }
 }
 
