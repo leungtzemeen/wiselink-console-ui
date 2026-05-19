@@ -1,6 +1,30 @@
 # WiseLink Console UI
 
-WiseLink AI 对话控制台前端：基于 **Vue 3 + Vite + TypeScript**，对接 Java 后端的 **SSE（`text/event-stream`）** 流式接口，支持 **智选灵犀**（导购对话）与 **Manus**（多步执行、步进事件展示）两种模式。适用于产品演示、本地联调与容器化部署。
+WiseLink AI 对话控制台前端：基于 **Vue 3 + Vite + TypeScript**，对接 Java 后端的 **SSE（`text/event-stream`）** 流式接口，支持 **智选灵犀**（导购对话）与 **Manus**（多步执行、步进事件展示）两种模式。适用于线上部署、本地联调与容器化交付。
+
+## 生态与相关仓库
+
+WiseLink 能力按职责拆在 **三个独立 GitHub 仓库**（便于分别演进与部署）。**本仓库仅为浏览器端 UI**；对话推理、RAG、Manus 编排与 MCP 工具由后端仓库提供。
+
+| 仓库 | 说明 | 默认端口 |
+|------|------|----------|
+| **本仓库** · `wiselink-console-ui` | 对话控制台 SPA（智选灵犀 / Manus Tab、流式展示、停止生成） | 开发 `5173`；生产由 Nginx 托管静态资源 |
+| [gen-ai-agent-java](https://github.com/leungtzemeen/gen-ai-agent-java) | **后端主应用**（Spring Boot + Spring AI）：`GET /api/ai/chat` 导购 SSE、`GET /api/ai/chat/manus` Manus 步进 SSE；Function Calling、Modular RAG、会话记忆 | **8081**（`context-path: /api`） |
+| [wiselink-mcp-ecosystem](https://github.com/leungtzemeen/wiselink-mcp-ecosystem) | **MCP Server 子进程**：主应用通过 **stdio** 拉起；提供 `exportShoppingReport` 等工具（Markdown → PDF）；另在 **8082** 提供 HTTP 下载与 MCP WebMVC | **8082** |
+
+```
+浏览器 ──► wiselink-console-ui (本仓库)
+              │  /api/ai/chat、/api/ai/chat/manus  (SSE)
+              ▼
+         gen-ai-agent-java (8081)
+              │  stdio 拉起 MCP 子进程
+              ▼
+         wiselink-mcp-ecosystem (8082)
+```
+
+本地联调时：先启动 **gen-ai-agent-java**，再 `pnpm dev`；前端通过 Vite 将 `/api` 代理到 `127.0.0.1:8081`。MCP 由主应用按需拉起，**无需**为控制台单独启动 8082（除非调试 PDF 导出或 MCP HTTP）。
+
+各仓库的构建、环境变量与生产部署细节见其各自 **README**。
 
 ## 功能特性
 
