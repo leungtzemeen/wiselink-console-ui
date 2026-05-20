@@ -7,7 +7,7 @@
         <slot name="composer" />
       </div>
     </div>
-    <footer class="page-foot">© 2026 WiseLink. 保留所有权利。</footer>
+    <footer class="page-foot">© 2026 个人学习项目 · WiseLink 仅供技术演示，非商用。</footer>
   </div>
 </template>
 
